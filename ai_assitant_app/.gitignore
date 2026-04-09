@@ -60,6 +60,3 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
-
-# Local app secrets
-ai_assitant_app/Config/Secrets.xcconfig
