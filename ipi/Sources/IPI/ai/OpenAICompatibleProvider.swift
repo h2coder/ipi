@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 enum OpenAICompatibleProviderError: LocalizedError {
     case missingAPIKey(provider: String)
@@ -177,6 +178,19 @@ enum OpenAICompatibleProvider {
                     stream: true
                 )
                 let (bytes, response) = try await URLSession.shared.bytes(for: request)
+
+                // For non-2xx streaming responses, read the error body before throwing
+                if let httpResponse = response as? HTTPURLResponse,
+                   !(200 ..< 300).contains(httpResponse.statusCode) {
+                    var errorBody = ""
+                    for try await line in bytes.lines {
+                        errorBody += line
+                    }
+                    let bodyText = errorBody.isEmpty ? nil : errorBody
+                    try self.validate(response: response, body: bodyText?.data(using: .utf8))
+                    return
+                }
+
                 try self.validate(response: response)
 
                 stream.push(.start(partial: partialMessage()))
@@ -308,6 +322,11 @@ enum OpenAICompatibleProvider {
         return request
     }
 
+    private static let logger = Logger(
+        subsystem: "ipi",
+        category: "OpenAICompatibleProvider"
+    )
+
     private static func requestBody(
         model: IPIModel,
         context: IPIContext,
@@ -344,7 +363,14 @@ enum OpenAICompatibleProvider {
             }
         }
 
-        return try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+
+        if let bodyString = String(data: data, encoding: .utf8) {
+            self.logger.debug("REQUEST model=\(model.id) provider=\(model.provider) body=\(bodyString)")
+            NSLog("[IPI] REQUEST model=%@ provider=%@ body=%@", model.id, model.provider, bodyString)
+        }
+
+        return data
     }
 
     private static func validate(response: URLResponse, body: Data? = nil) throws {
@@ -358,11 +384,21 @@ enum OpenAICompatibleProvider {
 
         guard (200 ..< 300).contains(httpResponse.statusCode) else {
             let bodyText = body.flatMap { String(data: $0, encoding: .utf8) } ?? "<empty>"
+            self.logger.error("RESPONSE ERROR status=\(httpResponse.statusCode) body=\(bodyText)")
+            NSLog("[IPI] RESPONSE ERROR status=%d body=%@", httpResponse.statusCode, bodyText)
             throw OpenAICompatibleProviderError.requestFailed(
                 statusCode: httpResponse.statusCode,
                 body: bodyText
             )
         }
+
+        self.logger.info("RESPONSE OK status=\(httpResponse.statusCode)")
+    }
+
+    private static func isKimiProvider(_ model: IPIModel) -> Bool {
+        let host = model.baseURL.host?.lowercased() ?? ""
+        let provider = model.provider.lowercased()
+        return host.contains("moonshot") || provider.contains("kimi") || provider.contains("moonshot")
     }
 
     private static func requestMessages(
@@ -389,19 +425,29 @@ enum OpenAICompatibleProvider {
                     ])
                 }
             case .assistant(let assistantMessage):
+                let isKimi = Self.isKimiProvider(model)
+
                 let textParts = assistantMessage.content.compactMap { block -> String? in
                     switch block {
                     case .text(let text):
                         return text
                     case .thinking(let thinking):
-                        return thinking
+                        // For Kimi, thinking goes to reasoning_content; for others, keep in content
+                        return isKimi ? nil : thinking
                     case .toolCall:
                         return nil
                     }
                 }
 
+                let thinkingParts: [String] = isKimi
+                    ? assistantMessage.content.compactMap { block -> String? in
+                        guard case .thinking(let thinking) = block else { return nil }
+                        return thinking
+                    }
+                    : []
+
                 let toolCalls = assistantMessage.toolCalls
-                if textParts.isEmpty && toolCalls.isEmpty {
+                if textParts.isEmpty && toolCalls.isEmpty && thinkingParts.isEmpty {
                     continue
                 }
 
@@ -409,6 +455,10 @@ enum OpenAICompatibleProvider {
                     "role": "assistant",
                     "content": textParts.joined(separator: "\n\n"),
                 ]
+
+                if isKimi {
+                    messageObject["reasoning_content"] = thinkingParts.joined(separator: "\n\n")
+                }
 
                 if !toolCalls.isEmpty {
                     messageObject["tool_calls"] = toolCalls.map { toolCall in
