@@ -346,6 +346,13 @@ public extension IPIAssistantMessage {
             return toolCall
         }
     }
+
+    var thinkingText: String {
+        self.content.compactMap {
+            guard case .thinking(let text) = $0 else { return nil }
+            return text
+        }.joined(separator: "\n")
+    }
 }
 
 public extension IPIToolResultMessage {
