@@ -365,10 +365,12 @@ enum OpenAICompatibleProvider {
 
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
 
+        #if DEBUG
         if let bodyString = String(data: data, encoding: .utf8) {
             self.logger.debug("REQUEST model=\(model.id) provider=\(model.provider) body=\(bodyString)")
             NSLog("[IPI] REQUEST model=%@ provider=%@ body=%@", model.id, model.provider, bodyString)
         }
+        #endif
 
         return data
     }
@@ -383,9 +385,15 @@ enum OpenAICompatibleProvider {
         }
 
         guard (200 ..< 300).contains(httpResponse.statusCode) else {
+            let responseSize = body?.count ?? 0
+            #if DEBUG
             let bodyText = body.flatMap { String(data: $0, encoding: .utf8) } ?? "<empty>"
             self.logger.error("RESPONSE ERROR status=\(httpResponse.statusCode) body=\(bodyText)")
             NSLog("[IPI] RESPONSE ERROR status=%d body=%@", httpResponse.statusCode, bodyText)
+            #else
+            let bodyText = "Response body omitted (\(responseSize) bytes)."
+            self.logger.error("RESPONSE ERROR status=\(httpResponse.statusCode) responseSize=\(responseSize)")
+            #endif
             throw OpenAICompatibleProviderError.requestFailed(
                 statusCode: httpResponse.statusCode,
                 body: bodyText
@@ -401,7 +409,15 @@ enum OpenAICompatibleProvider {
         return host.contains("moonshot") || provider.contains("kimi") || provider.contains("moonshot")
     }
 
-    private static func requestMessages(
+    private static func requiresReasoningContent(_ model: IPIModel) -> Bool {
+        let host = model.baseURL.host?.lowercased() ?? ""
+        let provider = model.provider.lowercased()
+        return self.isKimiProvider(model)
+            || host.contains("deepseek")
+            || provider.contains("deepseek")
+    }
+
+    static func requestMessages(
         from context: IPIContext,
         model: IPIModel
     ) -> [[String: Any]] {
@@ -425,21 +441,20 @@ enum OpenAICompatibleProvider {
                     ])
                 }
             case .assistant(let assistantMessage):
-                let isKimi = Self.isKimiProvider(model)
+                let requiresReasoningContent = Self.requiresReasoningContent(model)
 
                 let textParts = assistantMessage.content.compactMap { block -> String? in
                     switch block {
                     case .text(let text):
                         return text
                     case .thinking(let thinking):
-                        // For Kimi, thinking goes to reasoning_content; for others, keep in content
-                        return isKimi ? nil : thinking
+                        return requiresReasoningContent ? nil : thinking
                     case .toolCall:
                         return nil
                     }
                 }
 
-                let thinkingParts: [String] = isKimi
+                let thinkingParts: [String] = requiresReasoningContent
                     ? assistantMessage.content.compactMap { block -> String? in
                         guard case .thinking(let thinking) = block else { return nil }
                         return thinking
@@ -456,7 +471,7 @@ enum OpenAICompatibleProvider {
                     "content": textParts.joined(separator: "\n\n"),
                 ]
 
-                if isKimi {
+                if requiresReasoningContent {
                     messageObject["reasoning_content"] = thinkingParts.joined(separator: "\n\n")
                 }
 
