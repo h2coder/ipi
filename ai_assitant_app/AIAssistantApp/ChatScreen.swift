@@ -11,11 +11,39 @@ struct ChatScreen: View {
         @Bindable var session = self.session
 
         GeometryReader { geometry in
-            let topHeight = geometry.size.height * 0.66
+            let topHeight = geometry.size.height * 0.57
             let scrollSignature = Self.scrollSignature(for: session.messages)
 
             ScrollViewReader { proxy in
                 VStack(spacing: 0) {
+                    HStack(spacing: 12) {
+                        Picker("Provider", selection: Binding(
+                            get: { session.selectedProvider },
+                            set: { session.selectProvider($0) }
+                        )) {
+                            ForEach(session.availableProviders, id: \.identifier) { provider in
+                                Text(provider.displayName).tag(provider.identifier)
+                            }
+                        }
+                        .accessibilityIdentifier("providerPicker")
+
+                        if session.selectedProvider == "deepseek" {
+                            Picker("API", selection: Binding(
+                                get: { session.selectedAPI },
+                                set: { session.selectAPI($0) }
+                            )) {
+                                Text("Completions API").tag("openai-completions")
+                                Text("Responses API").tag("openai-responses")
+                            }
+                            .accessibilityIdentifier("apiPicker")
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .disabled(session.isSending)
+                    .padding(.horizontal, 16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(red: 0.95, green: 0.97, blue: 0.99))
+
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 16) {
                             if session.messages.isEmpty {
@@ -108,6 +136,26 @@ struct ChatScreen: View {
                                     .stroke(Color(red: 0.69, green: 0.77, blue: 0.73), lineWidth: 1)
                             )
                             .accessibilityIdentifier("chatInputField")
+
+                        if session.selectedProvider == "deepseek" {
+                            Button {
+                                session.searchEnabled.toggle()
+                            } label: {
+                                HStack {
+                                    Text("Search")
+                                    Spacer()
+                                    Image(systemName: session.searchEnabled ? "checkmark.circle.fill" : "circle")
+                                        .font(.system(size: 24))
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(.subheadline, design: .rounded, weight: .medium))
+                            .foregroundStyle(Color(red: 0.16, green: 0.43, blue: 0.40))
+                            .disabled(session.isSending)
+                            .accessibilityValue(session.searchEnabled ? "On" : "Off")
+                            .accessibilityIdentifier("searchToggle")
+                        }
 
                         HStack(spacing: 12) {
                             if session.isSending {

@@ -42,11 +42,25 @@ struct AppConfiguration {
             bundle: bundle
         )
 
+        let deepseek = Self.providerConfiguration(
+            identifier: "deepseek",
+            nameKey: "PI_DEEPSEEK_NAME",
+            apiKeyKey: "PI_DEEPSEEK_API_KEY",
+            baseURLKey: "PI_DEEPSEEK_BASE_URL",
+            defaultModelKey: "PI_DEEPSEEK_DEFAULT_MODEL",
+            fallbackName: "DeepSeek",
+            fallbackBaseURL: URL(string: "https://api.deepseek.com")!,
+            fallbackModel: "deepseek-flash",
+            xcconfig: xcconfig,
+            bundle: bundle
+        )
+
         return AppConfiguration(
             defaultProvider: xcconfig.value(for: "PI_DEFAULT_PROVIDER", fallback: "modelscope"),
             providers: [
                 modelscope.identifier: modelscope,
                 kimi.identifier: kimi,
+                deepseek.identifier: deepseek,
             ]
         )
     }
@@ -55,20 +69,21 @@ struct AppConfiguration {
         self.providers[self.defaultProvider] ?? self.providers["modelscope"]!
     }
 
-    func defaultModel() -> IPIModel {
-        let provider = self.preferredProvider
+    func model(provider providerID: String, api: String = IPIAPI.openAICompletions) -> IPIModel {
+        let provider = self.providers[providerID] ?? self.preferredProvider
         return IPIModel(
             id: provider.defaultModel,
+            api: api,
             provider: provider.identifier,
             baseURL: provider.baseURL,
-            reasoning: true,
+            reasoning: provider.identifier != "deepseek",
             input: [.text],
             maxTokens: 1_024
         )
     }
 
-    func streamOptions() -> IPIStreamOptions {
-        let provider = self.preferredProvider
+    func streamOptions(provider providerID: String) -> IPIStreamOptions {
+        let provider = self.providers[providerID] ?? self.preferredProvider
         return IPIStreamOptions(
             temperature: 0,
             maxTokens: 1_024,
@@ -95,7 +110,7 @@ private extension AppConfiguration {
         ProviderConfiguration(
             identifier: identifier,
             displayName: xcconfig.value(for: nameKey, fallback: fallbackName),
-            apiKey: xcconfig.value(for: apiKeyKey, fallback: ""),
+            apiKey: xcconfig.value(for: apiKeyKey, fallback: identifier == "deepseek" ? xcconfig.value(for: "PI_DEEPSEEK_API_kEY", fallback: "") : ""),
             baseURL: self.urlValue(
                 xcconfigKey: baseURLKey,
                 fallback: fallbackBaseURL,

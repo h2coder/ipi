@@ -54,6 +54,10 @@ public final class IPIAgent {
         self.state.model = model
     }
 
+    public func setStreamOptions(_ options: IPIStreamOptions) {
+        self.streamOptions = options
+    }
+
     public func setThinkingLevel(_ thinkingLevel: IPIThinkingLevel) {
         self.state.thinkingLevel = thinkingLevel
     }
