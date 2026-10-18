@@ -4,7 +4,10 @@ public enum IPIAI {
         context: IPIContext,
         options: IPIStreamOptions = .init()
     ) -> IPIAssistantMessageEventStream {
-        OpenAICompatibleProvider.stream(
+        if model.api == IPIAPI.openAIResponses {
+            return DeepSeekResponsesProvider.stream(model: model, context: context, options: options)
+        }
+        return OpenAICompatibleProvider.stream(
             model: model,
             context: context,
             options: options

@@ -185,6 +185,9 @@
 				Base,
 			);
 			mainGroup = 8B41F63C2DEDD0D5001A66F9;
+			packageReferences = (
+				8B41F6862DEDD25C001A66F9 /* IPI */,
+			);
 			minimizedProjectReferenceProxies = 1;
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 8B41F6462DEDD0D5001A66F9 /* Products */;
@@ -467,13 +470,22 @@
 		};
 /* End XCConfigurationList section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		8B41F6862DEDD25C001A66F9 /* IPI */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../ipi;
+		};
+/* End XCLocalSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		8B41F6822DEDD23B001A66F9 /* IPI */ = {
 			isa = XCSwiftPackageProductDependency;
+			package = 8B41F6862DEDD25C001A66F9 /* IPI */;
 			productName = IPI;
 		};
 		8B41F6842DEDD25C001A66F9 /* IPI */ = {
 			isa = XCSwiftPackageProductDependency;
+			package = 8B41F6862DEDD25C001A66F9 /* IPI */;
 			productName = IPI;
 		};
 /* End XCSwiftPackageProductDependency section */

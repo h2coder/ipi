@@ -22,18 +22,26 @@ final class ChatSession {
     var messages: [MessageRow] = []
     var isSending = false
     var errorText: String?
+    var selectedProvider: String
+    var selectedAPI = IPIAPI.openAICompletions
+    var searchEnabled = false
+    let availableProviders: [ProviderConfiguration]
 
     private let agent: IPIAgent
+    private let configuration: AppConfiguration
     private var subscriptionToken: UUID?
 
     init() {
         let configuration = AppConfiguration.load()
+        self.configuration = configuration
+        self.selectedProvider = configuration.preferredProvider.identifier
+        self.availableProviders = configuration.providers.values.sorted { $0.displayName < $1.displayName }
         self.agent = IPIAgent(
-            model: configuration.defaultModel(),
+            model: configuration.model(provider: configuration.preferredProvider.identifier),
             systemPrompt: Self.systemPrompt,
             thinkingLevel: .off,
             tools: [Self.arithmeticTool],
-            streamOptions: configuration.streamOptions()
+            streamOptions: configuration.streamOptions(provider: configuration.preferredProvider.identifier)
         )
         self.errorText = nil
         self.subscriptionToken = self.agent.subscribe { [weak self] _ in
@@ -46,6 +54,30 @@ final class ChatSession {
         self.runLaunchQueryIfNeeded()
     }
 
+    func selectProvider(_ provider: String) {
+        guard !self.isSending, self.configuration.providers[provider] != nil else { return }
+        self.selectedProvider = provider
+        self.selectedAPI = IPIAPI.openAICompletions
+        self.applySelection()
+    }
+
+    func selectAPI(_ api: String) {
+        guard !self.isSending, self.selectedProvider == "deepseek",
+              api == IPIAPI.openAICompletions || api == IPIAPI.openAIResponses else { return }
+        self.selectedAPI = api
+        self.applySelection()
+    }
+
+    private func applySelection() {
+        self.agent.setModel(self.configuration.model(provider: self.selectedProvider, api: self.selectedAPI))
+        self.agent.setStreamOptions(self.configuration.streamOptions(provider: self.selectedProvider))
+        self.agent.setTools([Self.arithmeticTool])
+        self.agent.setSystemPrompt(Self.systemPrompt)
+        self.agent.clearMessages()
+        self.errorText = nil
+        self.syncFromAgent()
+    }
+
     func sendCurrentDraft() {
         let query = self.draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty, !self.isSending else {
@@ -53,6 +85,7 @@ final class ChatSession {
         }
 
         self.draft = ""
+        self.configureTools(for: query)
         self.isSending = true
         self.errorText = nil
 
@@ -63,6 +96,28 @@ final class ChatSession {
                 self.syncFromAgent()
             }
         }
+    }
+
+    private func configureTools(for question: String) {
+        let useSearch = self.selectedProvider == "deepseek"
+            && self.searchEnabled
+        var options = self.configuration.streamOptions(provider: self.selectedProvider)
+        if useSearch { options.maxTokens = 2_048 }
+        self.agent.setStreamOptions(options)
+
+        guard useSearch,
+              let provider = self.configuration.providers["deepseek"] else {
+            self.agent.setTools([Self.arithmeticTool])
+            self.agent.setSystemPrompt(Self.systemPrompt)
+            return
+        }
+
+        self.agent.setTools([
+            Self.arithmeticTool,
+            Self.searchTool(baseURL: provider.baseURL, apiKey: provider.apiKey, question: question),
+            Self.fetchTool(baseURL: provider.baseURL, apiKey: provider.apiKey),
+        ])
+        self.agent.setSystemPrompt(Self.systemPrompt + "\n" + Self.webResearchPrompt)
     }
 
     private func syncFromAgent() {
@@ -144,7 +199,16 @@ final class ChatSession {
 
             return []
         case .toolResult(let toolResultMessage):
-            let text = toolResultMessage.plainText
+            let text: String
+            switch toolResultMessage.toolName {
+            case "deepseek_search":
+                text = toolResultMessage.isError ? "搜索失败：\(toolResultMessage.plainText)" : "已搜索网页"
+            case "deepseek_fetch":
+                let title = toolResultMessage.details["title"]?.stringValue ?? "网页"
+                text = toolResultMessage.isError ? "抓取失败：\(toolResultMessage.plainText)" : "已抓取：\(title)"
+            default:
+                text = toolResultMessage.plainText
+            }
             guard !text.isEmpty else {
                 return []
             }
@@ -164,7 +228,7 @@ private extension ChatSession {
     static let systemPrompt = """
     你是一个简洁、直接、准确的中文 AI 助手。
     回答时优先给结论，再给一句简短解释。
-    遇到任何包含数字、括号以及加减乘除运算的算式或计算请求时，必须先调用 calculate_arithmetic 工具，再根据工具结果回答。
+    遇到算术计算请求时，必须先调用 calculate_arithmetic 工具，再根据工具结果回答。日期和年份本身不是算式。
     调用该工具前不要输出自然语言，也不要自己心算。
     在算术题的最终回答中，必须明确包含最终数值。
     如果用户问的是判断题，请先明确回答“是”或“不是”。
@@ -172,6 +236,73 @@ private extension ChatSession {
     当用户问“长城在北京吗”时，回答必须表达肯定意思，并明确包含“是”和“北京”。
     当用户说“背诵出师表”时，直接输出《前出师表》原文，不要拒绝，不要总结，不要额外说明。
     """
+
+    static let webResearchPrompt = """
+    当前启用了联网搜索。回答近期或时效性问题时，先调用 deepseek_search 搜索，再对关键结果调用 deepseek_fetch 核实内容。
+    最多选取三件有网页正文支持的重要事件。每件用一两句说明，区分事件发生日期与网页发布日期，并附上抓取过的来源 URL。
+    搜索摘要只是线索；未经 deepseek_fetch 抓取核实的细节不要当作确定事实，也不要为了凑数量添加未经核实的事件。
+    如果搜索或抓取失败，明确说明无法核实，不要编造事件。不要声称自己没有联网能力。
+    """
+
+    nonisolated static func searchTool(baseURL: URL, apiKey: String, question: String) -> IPIAgentTool {
+        IPIAgentTool(
+            name: "deepseek_search",
+            label: "网页搜索",
+            description: "搜索实时网页，获取带标题、URL、日期和摘要的结果。回答近期新闻或时效性问题时先调用此工具。",
+            parameters: [
+                "type": .string("object"),
+                "properties": .object([
+                    "query": .object([
+                        "type": .string("string"),
+                        "description": .string("1 到 128 字符的网页搜索词，可使用 after:、before: 等搜索语法"),
+                    ]),
+                ]),
+                "required": .array([.string("query")]),
+                "additionalProperties": .bool(false),
+            ]
+        ) { _, arguments, _ in
+            let query = arguments["query"]?.stringValue ?? ""
+            let results = try await DeepSeekWebTools.search(
+                query: query, originalQuestion: question, count: 5, baseURL: baseURL, apiKey: apiKey
+            )
+            let text = results.isEmpty ? "没有找到搜索结果。" : results.enumerated().map { index, result in
+                """
+                \(index + 1). \(result.title)
+                URL: \(result.url)
+                日期: \(result.date ?? "未知")
+                摘要: \(result.summary.isEmpty ? result.snippet : result.summary)
+                """
+            }.joined(separator: "\n\n")
+            return IPIAgentToolResult(content: [.text(text)])
+        }
+    }
+
+    nonisolated static func fetchTool(baseURL: URL, apiKey: String) -> IPIAgentTool {
+        IPIAgentTool(
+            name: "deepseek_fetch",
+            label: "抓取网页",
+            description: "按搜索结果中的 URL 抓取网页 Markdown 正文，用于核实事件细节及日期。",
+            parameters: [
+                "type": .string("object"),
+                "properties": .object([
+                    "url": .object([
+                        "type": .string("string"),
+                        "description": .string("要抓取的 HTTP 或 HTTPS 网页 URL"),
+                    ]),
+                ]),
+                "required": .array([.string("url")]),
+                "additionalProperties": .bool(false),
+            ]
+        ) { _, arguments, _ in
+            let url = arguments["url"]?.stringValue ?? ""
+            let page = try await DeepSeekWebTools.fetch(url: url, baseURL: baseURL, apiKey: apiKey)
+            let content = String(page.content.prefix(12_000))
+            return IPIAgentToolResult(
+                content: [.text("标题: \(page.title)\nURL: \(url)\n正文:\n\(content)")],
+                details: ["title": .string(page.title)]
+            )
+        }
+    }
 
     nonisolated static var arithmeticTool: IPIAgentTool {
         IPIAgentTool(

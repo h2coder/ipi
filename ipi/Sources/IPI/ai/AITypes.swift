@@ -2,6 +2,7 @@ import Foundation
 
 public enum IPIAPI {
     public static let openAICompletions = "openai-completions"
+    public static let openAIResponses = "openai-responses"
 }
 
 public enum IPIInputCapability: String, Sendable, Equatable, Codable {

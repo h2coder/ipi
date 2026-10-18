@@ -395,10 +395,11 @@ enum OpenAICompatibleProvider {
         self.logger.info("RESPONSE OK status=\(httpResponse.statusCode)")
     }
 
-    private static func isKimiProvider(_ model: IPIModel) -> Bool {
+    private static func requiresReasoningContent(_ model: IPIModel) -> Bool {
         let host = model.baseURL.host?.lowercased() ?? ""
         let provider = model.provider.lowercased()
         return host.contains("moonshot") || provider.contains("kimi") || provider.contains("moonshot")
+            || host.contains("deepseek") || provider.contains("deepseek")
     }
 
     private static func requestMessages(
@@ -425,21 +426,21 @@ enum OpenAICompatibleProvider {
                     ])
                 }
             case .assistant(let assistantMessage):
-                let isKimi = Self.isKimiProvider(model)
+                let needsReasoningContent = Self.requiresReasoningContent(model)
 
                 let textParts = assistantMessage.content.compactMap { block -> String? in
                     switch block {
                     case .text(let text):
                         return text
                     case .thinking(let thinking):
-                        // For Kimi, thinking goes to reasoning_content; for others, keep in content
-                        return isKimi ? nil : thinking
+                        // Providers using reasoning_content require it in a separate field on later turns.
+                        return needsReasoningContent ? nil : thinking
                     case .toolCall:
                         return nil
                     }
                 }
 
-                let thinkingParts: [String] = isKimi
+                let thinkingParts: [String] = needsReasoningContent
                     ? assistantMessage.content.compactMap { block -> String? in
                         guard case .thinking(let thinking) = block else { return nil }
                         return thinking
@@ -456,7 +457,7 @@ enum OpenAICompatibleProvider {
                     "content": textParts.joined(separator: "\n\n"),
                 ]
 
-                if isKimi {
+                if needsReasoningContent {
                     messageObject["reasoning_content"] = thinkingParts.joined(separator: "\n\n")
                 }
 
