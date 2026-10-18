@@ -365,10 +365,12 @@ enum OpenAICompatibleProvider {
 
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
 
+        #if DEBUG
         if let bodyString = String(data: data, encoding: .utf8) {
             self.logger.debug("REQUEST model=\(model.id) provider=\(model.provider) body=\(bodyString)")
             NSLog("[IPI] REQUEST model=%@ provider=%@ body=%@", model.id, model.provider, bodyString)
         }
+        #endif
 
         return data
     }
@@ -383,9 +385,15 @@ enum OpenAICompatibleProvider {
         }
 
         guard (200 ..< 300).contains(httpResponse.statusCode) else {
+            let responseSize = body?.count ?? 0
+            #if DEBUG
             let bodyText = body.flatMap { String(data: $0, encoding: .utf8) } ?? "<empty>"
             self.logger.error("RESPONSE ERROR status=\(httpResponse.statusCode) body=\(bodyText)")
             NSLog("[IPI] RESPONSE ERROR status=%d body=%@", httpResponse.statusCode, bodyText)
+            #else
+            let bodyText = "Response body omitted (\(responseSize) bytes)."
+            self.logger.error("RESPONSE ERROR status=\(httpResponse.statusCode) responseSize=\(responseSize)")
+            #endif
             throw OpenAICompatibleProviderError.requestFailed(
                 statusCode: httpResponse.statusCode,
                 body: bodyText
@@ -402,7 +410,7 @@ enum OpenAICompatibleProvider {
             || host.contains("deepseek") || provider.contains("deepseek")
     }
 
-    private static func requestMessages(
+    static func requestMessages(
         from context: IPIContext,
         model: IPIModel
     ) -> [[String: Any]] {
