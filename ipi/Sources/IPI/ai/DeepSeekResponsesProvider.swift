@@ -9,7 +9,7 @@ enum DeepSeekResponsesProvider {
             }
         }
 
-        Task {
+        let producer = Task {
             var content: [IPIAssistantContentBlock] = []
             var usage = IPIUsage.zero
             var stopReason: IPIStopReason = .stop
@@ -134,10 +134,11 @@ enum DeepSeekResponsesProvider {
                 stream.push(.error(reason: .error, error: message(error: error.localizedDescription)))
             }
         }
+        stream.attachProducer(producer)
         return stream
     }
 
-    private static func makeRequest(model: IPIModel, context: IPIContext, options: IPIStreamOptions) throws -> URLRequest {
+    static func makeRequest(model: IPIModel, context: IPIContext, options: IPIStreamOptions) throws -> URLRequest {
         let apiKey = options.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !apiKey.isEmpty else { throw OpenAICompatibleProviderError.missingAPIKey(provider: model.provider) }
 
@@ -174,6 +175,7 @@ enum DeepSeekResponsesProvider {
             body["tools"] = tools
         }
 
+        if !options.allowToolCalls { body["tool_choice"] = "none" }
         var request = URLRequest(url: model.baseURL.appending(path: "responses"))
         request.httpMethod = "POST"
         request.timeoutInterval = options.timeout

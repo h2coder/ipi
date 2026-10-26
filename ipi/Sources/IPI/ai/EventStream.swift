@@ -32,6 +32,9 @@ public final class IPIEventStream<Element: Sendable, Result: Sendable>: AsyncSeq
     private let continuation: AsyncStream<Element>.Continuation
     private let resultBox = IPIResultBox<Result>()
     private let completion: @Sendable (Element) -> Result?
+    private let producerLock = NSLock()
+    private var producer: Task<Void, Never>?
+    private var isCancelled = false
 
     public init(completion: @escaping @Sendable (Element) -> Result?) {
         var capturedContinuation: AsyncStream<Element>.Continuation?
@@ -40,6 +43,25 @@ public final class IPIEventStream<Element: Sendable, Result: Sendable>: AsyncSeq
         }
         self.continuation = capturedContinuation!
         self.completion = completion
+        self.continuation.onTermination = { [weak self] reason in
+            if case .cancelled = reason { self?.cancel() }
+        }
+    }
+
+    func attachProducer(_ producer: Task<Void, Never>) {
+        producerLock.lock()
+        self.producer = producer
+        let cancelled = isCancelled
+        producerLock.unlock()
+        if cancelled { producer.cancel() }
+    }
+
+    public func cancel() {
+        producerLock.lock()
+        isCancelled = true
+        let producer = self.producer
+        producerLock.unlock()
+        producer?.cancel()
     }
 
     public func push(_ element: Element) {

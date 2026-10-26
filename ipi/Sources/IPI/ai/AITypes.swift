@@ -116,6 +116,7 @@ public struct IPIStreamOptions: Sendable, Equatable {
     public var reasoning: IPIThinkingLevel?
     public var additionalHeaders: [String: String]
     public var timeout: TimeInterval
+    public var allowToolCalls: Bool
 
     public init(
         temperature: Double? = nil,
@@ -123,7 +124,8 @@ public struct IPIStreamOptions: Sendable, Equatable {
         apiKey: String? = nil,
         reasoning: IPIThinkingLevel? = nil,
         additionalHeaders: [String: String] = [:],
-        timeout: TimeInterval = 120
+        timeout: TimeInterval = 120,
+        allowToolCalls: Bool = true
     ) {
         self.temperature = temperature
         self.maxTokens = maxTokens
@@ -131,6 +133,7 @@ public struct IPIStreamOptions: Sendable, Equatable {
         self.reasoning = reasoning
         self.additionalHeaders = additionalHeaders
         self.timeout = timeout
+        self.allowToolCalls = allowToolCalls
     }
 }
 
