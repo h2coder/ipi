@@ -93,3 +93,24 @@ public enum IPIAgentEvent {
     case toolExecutionUpdate(toolCallId: String, toolName: String, arguments: JSONObject, partialResult: IPIAgentToolResult)
     case toolExecutionEnd(toolCallId: String, toolName: String, result: IPIAgentToolResult, isError: Bool)
 }
+
+/// Bounds tool work per prompt. Concurrency is opt-in for callers whose tools
+/// are independent reads; the default preserves serial execution.
+public struct IPIAgentExecutionOptions: Sendable {
+    public let maxToolRounds: Int
+    public let maxToolCalls: Int
+    public let maxConcurrentTools: Int
+    public let maxToolDuration: Duration?
+
+    public init(
+        maxToolRounds: Int = 8,
+        maxToolCalls: Int = 24,
+        maxConcurrentTools: Int = 1,
+        maxToolDuration: Duration? = nil
+    ) {
+        self.maxToolRounds = max(0, maxToolRounds)
+        self.maxToolCalls = max(0, maxToolCalls)
+        self.maxConcurrentTools = max(1, maxConcurrentTools)
+        self.maxToolDuration = maxToolDuration
+    }
+}

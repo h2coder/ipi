@@ -5,14 +5,21 @@ public final class IPIAgent {
     public private(set) var state: IPIAgentState
 
     private var streamOptions: IPIStreamOptions
+    private let executionOptions: IPIAgentExecutionOptions
+    // Internal seam for deterministic agent-loop tests.
+    var streamResponse: @Sendable (IPIModel, IPIContext, IPIStreamOptions) -> IPIAssistantMessageEventStream = {
+        IPIAI.streamSimple($0, context: $1, options: $2)
+    }
     private var listeners: [UUID: (IPIAgentEvent) -> Void] = [:]
 
     public init(
         initialState: IPIAgentState,
-        streamOptions: IPIStreamOptions = .init()
+        streamOptions: IPIStreamOptions = .init(),
+        executionOptions: IPIAgentExecutionOptions = .init()
     ) {
         self.state = initialState
         self.streamOptions = streamOptions
+        self.executionOptions = executionOptions
     }
 
     public convenience init(
@@ -21,7 +28,8 @@ public final class IPIAgent {
         thinkingLevel: IPIThinkingLevel = .off,
         tools: [IPIAgentTool] = [],
         messages: [IPIAgentMessage] = [],
-        streamOptions: IPIStreamOptions = .init()
+        streamOptions: IPIStreamOptions = .init(),
+        executionOptions: IPIAgentExecutionOptions = .init()
     ) {
         self.init(
             initialState: IPIAgentState(
@@ -31,7 +39,8 @@ public final class IPIAgent {
                 tools: tools,
                 messages: messages
             ),
-            streamOptions: streamOptions
+            streamOptions: streamOptions,
+            executionOptions: executionOptions
         )
     }
 
@@ -125,21 +134,27 @@ public final class IPIAgent {
             }
         }
 
-        while true {
+        var toolRounds = 0
+        var toolCallCount = 0
+        while !Task.isCancelled {
             if shouldEmitTurnStart {
                 self.emit(.turnStart)
             }
             shouldEmitTurnStart = true
 
-            let assistantMessage = await self.streamAssistantResponse()
+            let remainingCalls = max(0, self.executionOptions.maxToolCalls - toolCallCount)
+            let allowTools = toolRounds < self.executionOptions.maxToolRounds && remainingCalls > 0
+            let assistantMessage = await self.streamAssistantResponse(allowTools: allowTools)
             let assistantAgentMessage = IPIAgentMessage.assistant(assistantMessage)
             let toolCalls = assistantMessage.toolCalls
 
             var toolResults: [IPIToolResultMessage] = []
             if assistantMessage.stopReason != .error &&
                 assistantMessage.stopReason != .aborted &&
-                !toolCalls.isEmpty {
-                toolResults = await self.executeToolCalls(toolCalls)
+                !toolCalls.isEmpty && !Task.isCancelled {
+                toolResults = await self.executeToolCalls(toolCalls, limit: allowTools ? remainingCalls : 0)
+                toolRounds += 1
+                toolCallCount += min(toolCalls.count, allowTools ? remainingCalls : 0)
             }
 
             self.emit(
@@ -151,7 +166,7 @@ public final class IPIAgent {
 
             if assistantMessage.stopReason == .error ||
                 assistantMessage.stopReason == .aborted ||
-                toolCalls.isEmpty {
+                toolCalls.isEmpty || !allowTools {
                 break
             }
         }
@@ -162,21 +177,18 @@ public final class IPIAgent {
         self.emit(.agentEnd(messages: self.state.messages))
     }
 
-    private func streamAssistantResponse() async -> IPIAssistantMessage {
+    private func streamAssistantResponse(allowTools: Bool) async -> IPIAssistantMessage {
         var resolvedStreamOptions = self.streamOptions
-        resolvedStreamOptions.reasoning = self.state.thinkingLevel == .off ? nil : self.state.thinkingLevel
+        resolvedStreamOptions.reasoning = self.state.thinkingLevel
+        resolvedStreamOptions.allowToolCalls = allowTools
 
         let context = IPIContext(
-            systemPrompt: self.state.systemPrompt,
+            systemPrompt: self.state.systemPrompt + (allowTools ? "" : "\nTool budget reached. Do not call tools. Give your final answer now using the evidence already collected. Explain any missing evidence briefly."),
             messages: self.state.messages,
             tools: self.state.tools.map(\.definition)
         )
 
-        let response = IPIAI.streamSimple(
-            self.state.model,
-            context: context,
-            options: resolvedStreamOptions
-        )
+        let response = self.streamResponse(self.state.model, context, resolvedStreamOptions)
 
         var didStartMessage = false
 
@@ -221,80 +233,88 @@ public final class IPIAgent {
         return finalMessage
     }
 
-    private func executeToolCalls(_ toolCalls: [IPIToolCall]) async -> [IPIToolResultMessage] {
-        var toolResults: [IPIToolResultMessage] = []
-
-        for toolCall in toolCalls {
-            self.state.pendingToolCalls.insert(toolCall.id)
-            self.emit(
-                .toolExecutionStart(
-                    toolCallId: toolCall.id,
-                    toolName: toolCall.name,
-                    arguments: toolCall.arguments
-                )
-            )
-
-            let tool = self.state.tools.first { $0.name == toolCall.name }
-            var result = IPIAgentToolResult(content: [.text("Tool not found: \(toolCall.name)")])
-            var isError = true
-
-            if let tool {
-                do {
-                    result = try await tool.execute(toolCall.id, toolCall.arguments) { [weak self] partialResult in
-                        guard let self else {
-                            return
-                        }
-                        Task { @MainActor in
-                            self.emit(
-                                .toolExecutionUpdate(
-                                    toolCallId: toolCall.id,
-                                    toolName: toolCall.name,
-                                    arguments: toolCall.arguments,
-                                    partialResult: partialResult
-                                )
-                            )
-                        }
-                    }
-                    isError = false
-                } catch {
-                    result = IPIAgentToolResult(
-                        content: [.text(error.localizedDescription)]
-                    )
-                    isError = true
+    private func executeToolCalls(_ toolCalls: [IPIToolCall], limit: Int) async -> [IPIToolResultMessage] {
+        // Record results in model call order even when requests finish out of order.
+        await withTaskGroup(of: (Int, IPIToolResultMessage).self) { group in
+            var results: [Int: IPIToolResultMessage] = [:]
+            var nextIndex = 0
+            let concurrency = self.executionOptions.maxConcurrentTools
+            for _ in 0..<min(concurrency, toolCalls.count) {
+                let index = nextIndex
+                nextIndex += 1
+                group.addTask { await (index, self.executeToolCall(toolCalls[index], allowed: index < limit)) }
+            }
+            while let (index, result) = await group.next() {
+                results[index] = result
+                if nextIndex < toolCalls.count && !Task.isCancelled {
+                    let index = nextIndex
+                    nextIndex += 1
+                    group.addTask { await (index, self.executeToolCall(toolCalls[index], allowed: index < limit)) }
                 }
             }
-
-            self.emit(
-                .toolExecutionEnd(
-                    toolCallId: toolCall.id,
-                    toolName: toolCall.name,
-                    result: result,
-                    isError: isError
-                )
-            )
-
-            let toolResultMessage = IPIToolResultMessage(
-                toolCallId: toolCall.id,
-                toolName: toolCall.name,
-                content: result.content,
-                details: result.details,
-                isError: isError
-            )
-            let agentMessage = IPIAgentMessage.toolResult(toolResultMessage)
-
-            self.state.messages.append(agentMessage)
-            toolResults.append(toolResultMessage)
-            self.emit(.messageStart(message: agentMessage))
-            self.emit(.messageEnd(message: agentMessage))
-            self.state.pendingToolCalls.remove(toolCall.id)
+            let orderedResults = toolCalls.indices.compactMap { results[$0] }
+            for result in orderedResults {
+                let message = IPIAgentMessage.toolResult(result)
+                self.state.messages.append(message)
+                self.emit(.messageStart(message: message))
+                self.emit(.messageEnd(message: message))
+            }
+            return orderedResults
         }
+    }
 
-        return toolResults
+    private func executeToolCall(_ call: IPIToolCall, allowed: Bool) async -> IPIToolResultMessage {
+        self.state.pendingToolCalls.insert(call.id)
+        defer { self.state.pendingToolCalls.remove(call.id) }
+        self.emit(.toolExecutionStart(toolCallId: call.id, toolName: call.name, arguments: call.arguments))
+        var result: IPIAgentToolResult
+        var isError = true
+        if !allowed {
+            result = IPIAgentToolResult(content: [.text("Tool budget reached. Use the evidence already collected to answer now.")])
+        } else if Task.isCancelled {
+            result = IPIAgentToolResult(content: [.text("Cancelled")])
+        } else if let tool = self.state.tools.first(where: { $0.name == call.name }) {
+            do {
+                let onUpdate: IPIAgentToolUpdateHandler = { [weak self] partial in
+                    Task { @MainActor in
+                        self?.emit(.toolExecutionUpdate(toolCallId: call.id, toolName: call.name,
+                            arguments: call.arguments, partialResult: partial))
+                    }
+                }
+                if let duration = self.executionOptions.maxToolDuration {
+                    result = try await withThrowingTaskGroup(of: IPIAgentToolResult.self) { group in
+                        group.addTask { try await tool.execute(call.id, call.arguments, onUpdate) }
+                        group.addTask {
+                            try await Task.sleep(for: duration)
+                            throw ToolTimeBudgetExceeded()
+                        }
+                        defer { group.cancelAll() }
+                        return try await group.next()!
+                    }
+                } else {
+                    result = try await tool.execute(call.id, call.arguments, onUpdate)
+                }
+                isError = false
+            } catch {
+                result = IPIAgentToolResult(content: [.text(error.localizedDescription)])
+            }
+        } else {
+            result = IPIAgentToolResult(content: [.text("Tool not found: \(call.name)")])
+        }
+        self.emit(.toolExecutionEnd(toolCallId: call.id, toolName: call.name, result: result, isError: isError))
+        return IPIToolResultMessage(toolCallId: call.id, toolName: call.name,
+            content: result.content, details: result.details, isError: isError)
     }
 
     private func emit(_ event: IPIAgentEvent) {
         for listener in self.listeners.values {
             listener(event)
         }
+    }
+}
+
+private struct ToolTimeBudgetExceeded: LocalizedError {
+    var errorDescription: String? {
+        "Tool time budget exceeded. Use the evidence already collected, or try one alternative source."
     }
 }

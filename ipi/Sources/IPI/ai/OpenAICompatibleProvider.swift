@@ -19,7 +19,8 @@ enum OpenAICompatibleProvider {
     static func stream(
         model: IPIModel,
         context: IPIContext,
-        options: IPIStreamOptions
+        options: IPIStreamOptions,
+        session: URLSession = .shared
     ) -> IPIAssistantMessageEventStream {
         let stream = IPIAssistantMessageEventStream { event in
             switch event {
@@ -32,12 +33,14 @@ enum OpenAICompatibleProvider {
             }
         }
 
-        Task {
+        let producer = Task {
             let timestamp = Date()
             var content: [IPIAssistantContentBlock] = []
             var usage = IPIUsage.zero
             var stopReason: IPIStopReason = .stop
             var currentBlock: CurrentStreamBlock?
+            var toolCallIndices: [Int: Int] = [:]
+            var toolCallArguments: [Int: String] = [:]
 
             func partialMessage(errorMessage: String? = nil) -> IPIAssistantMessage {
                 IPIAssistantMessage(
@@ -68,11 +71,7 @@ enum OpenAICompatibleProvider {
                         break
                     }
                     stream.push(.thinkingEnd(contentIndex: index, content: thinking, partial: partialMessage()))
-                case .toolCall(let index, _):
-                    guard case .toolCall(let toolCall) = content[index] else {
-                        break
-                    }
-                    stream.push(.toolCallEnd(contentIndex: index, toolCall: toolCall, partial: partialMessage()))
+
                 }
 
                 currentBlock = nil
@@ -127,47 +126,34 @@ enum OpenAICompatibleProvider {
             }
 
             func appendToolCallDelta(_ delta: ChatCompletionChunk.ToolCallDelta) {
+                // Tool calls can arrive interleaved. Their stream index, rather
+                // than the last content block, owns each argument buffer.
+                finishCurrentBlock()
+                let streamIndex = delta.index ?? 0
                 let index: Int
-                var partialArguments = ""
-
-                if case .toolCall(let currentIndex, let currentArguments) = currentBlock {
-                    index = currentIndex
-                    partialArguments = currentArguments
+                if let existingIndex = toolCallIndices[streamIndex] {
+                    index = existingIndex
                 } else {
-                    finishCurrentBlock()
-                    content.append(
-                        .toolCall(
-                            IPIToolCall(
-                                id: delta.id ?? "",
-                                name: delta.function?.name ?? "",
-                                arguments: [:]
-                            )
-                        )
-                    )
-                    index = content.count - 1
-                    currentBlock = .toolCall(index, "")
+                    index = content.count
+                    toolCallIndices[streamIndex] = index
+                    content.append(.toolCall(IPIToolCall(
+                        id: delta.id ?? "", name: delta.function?.name ?? "", arguments: [:]
+                    )))
                     stream.push(.toolCallStart(contentIndex: index, partial: partialMessage()))
                 }
-
-                guard case .toolCall(let existingToolCall) = content[index] else {
-                    return
-                }
-
-                let argumentsDelta = delta.function?.arguments ?? ""
-                partialArguments += argumentsDelta
-
+                guard case .toolCall(let existingToolCall) = content[index] else { return }
+                toolCallArguments[streamIndex, default: ""] += delta.function?.arguments ?? ""
                 let updatedToolCall = IPIToolCall(
                     id: delta.id ?? existingToolCall.id,
                     name: delta.function?.name ?? existingToolCall.name,
                     arguments: self.decodePartialArguments(
-                        partialArguments,
-                        fallback: existingToolCall.arguments
+                        toolCallArguments[streamIndex] ?? "", fallback: existingToolCall.arguments
                     )
                 )
-
                 content[index] = .toolCall(updatedToolCall)
-                currentBlock = .toolCall(index, partialArguments)
-                stream.push(.toolCallDelta(contentIndex: index, delta: argumentsDelta, partial: partialMessage()))
+                stream.push(.toolCallDelta(
+                    contentIndex: index, delta: delta.function?.arguments ?? "", partial: partialMessage()
+                ))
             }
 
             do {
@@ -177,7 +163,7 @@ enum OpenAICompatibleProvider {
                     options: options,
                     stream: true
                 )
-                let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                let (bytes, response) = try await session.bytes(for: request)
 
                 // For non-2xx streaming responses, read the error body before throwing
                 if let httpResponse = response as? HTTPURLResponse,
@@ -246,6 +232,10 @@ enum OpenAICompatibleProvider {
                 }
 
                 finishCurrentBlock()
+                for index in toolCallIndices.values.sorted() {
+                    guard case .toolCall(let call) = content[index] else { continue }
+                    stream.push(.toolCallEnd(contentIndex: index, toolCall: call, partial: partialMessage()))
+                }
                 stream.push(.done(reason: stopReason, message: partialMessage()))
             } catch {
                 let errorMessage = IPIAssistantMessage(
@@ -254,13 +244,14 @@ enum OpenAICompatibleProvider {
                     provider: model.provider,
                     model: model.id,
                     usage: usage,
-                    stopReason: .error,
+                    stopReason: Task.isCancelled ? .aborted : .error,
                     errorMessage: error.localizedDescription
                 )
-                stream.push(.error(reason: .error, error: errorMessage))
+                stream.push(.error(reason: errorMessage.stopReason, error: errorMessage))
             }
         }
 
+        stream.attachProducer(producer)
         return stream
     }
 
@@ -327,7 +318,7 @@ enum OpenAICompatibleProvider {
         category: "OpenAICompatibleProvider"
     )
 
-    private static func requestBody(
+    static func requestBody(
         model: IPIModel,
         context: IPIContext,
         options: IPIStreamOptions,
@@ -347,7 +338,13 @@ enum OpenAICompatibleProvider {
 
         if model.reasoning {
             let shouldEnableThinking = options.reasoning != nil && options.reasoning != .off
-            payload["enable_thinking"] = shouldEnableThinking
+            let isDeepSeek = model.provider.lowercased().contains("deepseek")
+                || model.baseURL.host?.lowercased() == "api.deepseek.com"
+            if isDeepSeek {
+                payload["thinking"] = ["type": shouldEnableThinking ? "enabled" : "disabled"]
+            } else {
+                payload["enable_thinking"] = shouldEnableThinking
+            }
         }
 
         if !context.tools.isEmpty {
@@ -363,6 +360,7 @@ enum OpenAICompatibleProvider {
             }
         }
 
+        if !options.allowToolCalls { payload["tool_choice"] = "none" }
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
 
         #if DEBUG
@@ -629,7 +627,6 @@ enum OpenAICompatibleProvider {
 private enum CurrentStreamBlock {
     case text(Int)
     case thinking(Int)
-    case toolCall(Int, String)
 }
 
 private struct ChatCompletionResponse: Decodable {
